@@ -113,7 +113,7 @@ class DbusGoeChargerService:
     accessType = config['DEFAULT']['AccessType']
     
     if accessType == 'OnPremise': 
-      URL = "http://%s/api/status" % (config['ONPREMISE']['Host'])
+      URL = "http://%s/status" % (config['ONPREMISE']['Host'])
     else:
       raise ValueError("AccessType %s is not supported" % (config['DEFAULT']['AccessType']))
     
@@ -144,7 +144,7 @@ class DbusGoeChargerService:
     if not json_data:
         raise ValueError("Converting response to JSON failed")
     
-    if json_data[parameter] == str(value):
+    if str(json_data[parameter]) == str(value):
       return True
     else:
       logging.warning("go-eCharger parameter %s not set to %s" % (parameter, str(value)))
@@ -152,7 +152,8 @@ class DbusGoeChargerService:
     
  
   def _getGoeChargerData(self, filter):
-    URL = "%s?filter=%s" % (self._getGoeChargerStatusUrl(), filter)
+    # API v1 does not support parameter filtering on the status endpoint.
+    URL = self._getGoeChargerStatusUrl()
     try:
        request_data = requests.get(url = URL, timeout=1)
     except Exception:
@@ -187,38 +188,35 @@ class DbusGoeChargerService:
        if data is not None:
 
           '''
-          data['nrg']
+          data['nrg'] in API v1
           0 = U L1
           1 = U L2
           2 = U L3
           3 = U N
-          4 = I L1
-          5 = I L2
-          6 = I L3
-          7 = P L1
-          8 = P L2
-          9 = P L3
-          10 = P N
-          11 = P Total
+          4 = I L1 (in 0.1A)
+          5 = I L2 (in 0.1A)
+          6 = I L3 (in 0.1A)
+          7 = P L1 (in 0.1kW)
+          8 = P L2 (in 0.1kW)
+          9 = P L3 (in 0.1kW)
+          10 = P N (in 0.1kW)
+          11 = P Total (in 0.01kW)
           12 = PF L1
           13 = PF L2
           14 = PF L3
           15 = PF N
           '''
-          config = self._getConfig()
-          hardwareVersion = int(config['DEFAULT']['HardwareVersion'])
-
+          
           #send data to DBus
           self._dbusservice['/Ac/Voltage'] = int(data['nrg'][0])
-          self._dbusservice['/Ac/L1/Power'] = int(data['nrg'][7])
-          self._dbusservice['/Ac/L2/Power'] = int(data['nrg'][8])
-          self._dbusservice['/Ac/L3/Power'] = int(data['nrg'][9])
-          self._dbusservice['/Ac/Power'] = int(data['nrg'][11])
-          self._dbusservice['/Current'] = max(data['nrg'][4], data['nrg'][5], data['nrg'][6])
-          if int(hardwareVersion) < 4: 
-            self._dbusservice['/Ac/Energy/Forward'] = int(float(data['eto']) / 1000.0)
-          else:
-            self._dbusservice['/Ac/Energy/Forward'] = round(data['wh'] / 1000, 2)
+          self._dbusservice['/Ac/L1/Power'] = int(data['nrg'][7]) * 100
+          self._dbusservice['/Ac/L2/Power'] = int(data['nrg'][8]) * 100
+          self._dbusservice['/Ac/L3/Power'] = int(data['nrg'][9]) * 100
+          self._dbusservice['/Ac/Power'] = int(data['nrg'][11]) * 10
+          self._dbusservice['/Current'] = max(data['nrg'][4], data['nrg'][5], data['nrg'][6]) / 10.0
+          
+          # eto in v1 is Total charged energy in 0.1kWh
+          self._dbusservice['/Ac/Energy/Forward'] = float(data['eto']) / 10.0
           
           self._dbusservice['/StartStop'] = int(data['alw'])
           self._dbusservice['/SetCurrent'] = int(data['amp'])
@@ -234,13 +232,8 @@ class DbusGoeChargerService:
 
           self._dbusservice['/Mode'] = 0  # Manual, no control
           
-          config = self._getConfig()
-          hardwareVersion = int(config['DEFAULT']['HardwareVersion'])
           if '/MCU/Temperature' in self._dbusservice: # check if path exists, at some point it was removed
-             if hardwareVersion >= 3:
-                self._dbusservice['/MCU/Temperature'] = int(data['tma'][0] if data['tma'][0] else 0)
-             else:
-                self._dbusservice['/MCU/Temperature'] = int(data['tmp'])
+             self._dbusservice['/MCU/Temperature'] = int(data['tmp'])
 
           # carState, null if internal error (Unknown/Error=0, Idle=1, Charging=2, WaitCar=3, Complete=4, Error=5)
           # status 0=Disconnected; 1=Connected; 2=Charging; 3=Charged; 4=Waiting for sun; 5=Waiting for RFID; 6=Waiting for start; 7=Low SOC; 8=Ground fault; 9=Welded contacts; 10=CP Input shorted; 11=Residual current detected; 12=Under voltage detected; 13=Overvoltage detected; 14=Overheating detected
