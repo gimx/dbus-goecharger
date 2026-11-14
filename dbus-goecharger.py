@@ -6,9 +6,9 @@ Venus OS D-Bus driver for a go-eCharger (hardware v2, local HTTP API v1).
 Publishes the charger as com.victronenergy.evcharger, so it shows up in the GUI and on VRM.
 
 Modes (/Mode):
-  0 Manual: /StartStop and /SetCurrent from the GUI or VRM control the charger.
-  1 Auto:   the charger is controlled by Home Assistant (PV surplus, cheap energy, ...),
-            this driver only reports and rejects /StartStop and /SetCurrent writes.
+  0 Manual: /StartStop and /SetCurrent from the GUI, VRM or Home Assistant control the charger.
+  1 Auto:   the Venus OS Opportunity Loads control the charger via S2 (see s2rm.py),
+            /StartStop and /SetCurrent writes are rejected.
   2 Scheduled is not supported.
 """
 
@@ -28,8 +28,10 @@ import dbus
 sys.path.insert(1, '/opt/victronenergy/dbus-systemcalc-py/ext/velib_python')
 from vedbus import VeDbusService
 from settingsdevice import SettingsDevice
+sys.path.insert(1, os.path.dirname(os.path.realpath(__file__)))
+from s2rm import S2RmItem, S2ResourceManager, PHASES
 
-VERSION = '2.0'
+VERSION = '2.1'
 
 MODE_MANUAL = 0
 MODE_AUTO = 1
@@ -75,6 +77,8 @@ class DbusGoeChargerService:
 
         self._last_update = 0
         self._charging_time = 0.0
+        self._handled_mode = None
+        self._phase_candidate = (None, 0)
 
         # the mode survives restarts of the driver
         self._settings = SettingsDevice(
@@ -119,6 +123,22 @@ class DbusGoeChargerService:
         self._dbusservice.add_path('/StartStop', None, writeable=True, onchangecallback=self._handle_changed_value)
         self._dbusservice.add_path('/SetCurrent', None, writeable=True, gettextcallback=_a, onchangecallback=self._handle_changed_value)
         self._dbusservice.add_path('/MaxCurrent', None, gettextcallback=_a)
+
+        # S2 resource manager for the Opportunity Loads
+        self._dbusservice.add_path('/GxAutoMode/ChargingCurrent', None, gettextcallback=_a)
+        self._dbusservice.add_path('/S2/0/Active', 0)
+        s2_item = self._dbusservice.add_path('/S2/0/Rm', None, itemtype=S2RmItem)
+        self._s2 = S2ResourceManager(
+            s2_item,
+            apply_current=self._apply_s2_current,
+            ombc_allowed=lambda: self._dbusservice['/Mode'] == MODE_AUTO,
+            name=productname,
+            serial=str(data.get('sse') or deviceinstance),
+            model='go-eCharger HW v%d' % hardware_version,
+            firmware=str(data.get('fwv') or ''),
+        )
+
+        self._handled_mode = self._dbusservice['/Mode']
 
         if data:
             self._publish(data)
@@ -195,6 +215,22 @@ class DbusGoeChargerService:
         # phases after the contactor (pha bits 3..5)
         s['/Ac/PhaseCount'] = bin((int(data.get('pha', 0)) >> 3) & 7).count('1') or None
 
+        # S2: the phases the car charges on (house phases, wired in reverse order like the
+        # power above), the charger maximum and the power
+        house_currents = (nrg[6] / 10.0, nrg[5] / 10.0, nrg[4] / 10.0)
+        phases = None
+        if int(data['car']) == 2:
+            seen = tuple(p for p, i in zip(PHASES, house_currents) if i > 1.5)
+            candidate, count = self._phase_candidate
+            count = count + 1 if seen == candidate else 1
+            self._phase_candidate = (seen, count)
+            if seen and count >= 3:
+                phases = list(seen)
+        self._s2.update_capabilities(max_current=int(data['ama']), phases=phases)
+        self._s2.report_power(s['/Ac/L1/Power'], s['/Ac/L2/Power'], s['/Ac/L3/Power'])
+        self._s2.report_status(0 if int(data['alw']) == 0 else int(data['amx']))
+        s['/S2/0/Active'] = 1 if self._s2.ombc_active else 0
+
         # energy of the current session (dws in deka-watt-seconds), total energy (eto in 0.1kWh)
         s['/Ac/Energy/Forward'] = round(int(data['dws']) / 360000.0, 2)
         s['/Ac/Energy/Total'] = int(data['eto']) / 10.0
@@ -229,6 +265,7 @@ class DbusGoeChargerService:
                 logging.info("go-eCharger at %s reachable", self._host)
             self._dbusservice['/Connected'] = 1
             self._publish(data)
+            self._enforce_s2_instruction(data)
 
             self._dbusservice['/UpdateIndex'] = (self._dbusservice['/UpdateIndex'] + 1) % 256
             self._last_update = time.time()
@@ -246,9 +283,43 @@ class DbusGoeChargerService:
 
     # --- control ----------------------------------------------------------------------------------
 
+    def _apply_s2_current(self, current):
+        """Instruction of the Opportunity Loads: 0 = stop, else charge with current A."""
+        self._dbusservice['/GxAutoMode/ChargingCurrent'] = current
+        if current == 0:
+            data = self._set_value('alw', 0)
+        else:
+            data = self._set_value('amx', current)
+            if data is not None and int(data.get('alw', 0)) != 1:
+                data = self._set_value('alw', 1)
+        if data is None:
+            return False
+        GLib.idle_add(self._publish, data)
+        return True
+
+    def _enforce_s2_instruction(self, data):
+        """Keep the charger at the last instruction of the Opportunity Loads while they control it."""
+        current = self._s2.requested_current
+        if not self._s2.ombc_active or current is None:
+            return
+        actual = 0 if int(data['alw']) == 0 else int(data['amx'])
+        if actual != current:
+            logging.warning("go-eCharger at %d A, the Opportunity Loads want %d A, correcting", actual, current)
+            self._apply_s2_current(current)
+
+    def _mode_changed(self):
+        mode = self._dbusservice['/Mode']
+        if mode == self._handled_mode:
+            return
+        self._handled_mode = mode
+        if mode != MODE_AUTO:
+            self._dbusservice['/GxAutoMode/ChargingCurrent'] = None
+        self._s2.mode_changed()
+
     def _on_setting_changed(self, setting, oldvalue, newvalue):
         if setting == 'mode':
             self._dbusservice['/Mode'] = newvalue
+            self._mode_changed()
 
     def _handle_changed_value(self, path, value):
         logging.info("GUI/VRM changed %s to %s", path, value)
@@ -260,7 +331,9 @@ class DbusGoeChargerService:
                     logging.warning("Mode %s is not supported, only 0 (Manual) and 1 (Auto)", value)
                     return False
                 self._settings['mode'] = mode
-                logging.info("Mode %s", "Auto, Home Assistant controls the charger" if mode == MODE_AUTO else "Manual")
+                logging.info("Mode %s", "Auto, the Opportunity Loads control the charger" if mode == MODE_AUTO else "Manual")
+                # the item takes the new value after this callback returned
+                GLib.idle_add(lambda: self._mode_changed() and False)
                 return True
 
             if self._dbusservice['/Mode'] != MODE_MANUAL:

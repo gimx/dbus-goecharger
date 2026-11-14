@@ -1,5 +1,6 @@
 #!/bin/sh
-SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+SCRIPT_DIR=$(dirname "$(realpath "$0")")
 
 exec 2>&1
-python $(realpath $SCRIPT_DIR/../dbus-goecharger.py)
+# exec: the service supervisor must signal python itself, else svc -t leaves it running orphaned
+exec python "$(realpath "$SCRIPT_DIR/../dbus-goecharger.py")"
